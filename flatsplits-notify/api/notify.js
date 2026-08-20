@@ -43,7 +43,7 @@ module.exports = async (req, res) => {
   const targets = [];
   members.forEach((m, idx) => {
     if (!m || !m.fcmToken) return;
-    if (m.username === addedByUsername) return; // don't notify whoever just added it
+    if (String(m.username || '').toLowerCase() === String(addedByUsername || '').toLowerCase()) return; // don't notify whoever just added it
     targets.push({ idx, token: m.fcmToken });
   });
 
