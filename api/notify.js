@@ -4,6 +4,8 @@
 
 const admin = require('firebase-admin');
 
+const DEBUG_VERSION = 'v3-debug';
+
 function getAdmin() {
   if (!admin.apps.length) {
     admin.initializeApp({
@@ -20,16 +22,16 @@ function getAdmin() {
 
 module.exports = async (req, res) => {
   if (req.method !== 'POST') {
-    return res.status(405).json({ error: 'POST only' });
+    return res.status(405).json({ error: 'POST only', version: DEBUG_VERSION });
   }
 
   if (req.headers['x-notify-secret'] !== process.env.NOTIFY_SECRET) {
-    return res.status(401).json({ error: 'unauthorized' });
+    return res.status(401).json({ error: 'unauthorized', version: DEBUG_VERSION });
   }
 
   const { houseId, addedByUsername, addedByName, description, amount } = req.body || {};
   if (!houseId || !addedByUsername) {
-    return res.status(400).json({ error: 'houseId and addedByUsername are required' });
+    return res.status(400).json({ error: 'houseId and addedByUsername are required', version: DEBUG_VERSION });
   }
 
   const fbAdmin = getAdmin();
@@ -39,16 +41,33 @@ module.exports = async (req, res) => {
   // each member optionally has a .fcmToken (written by setupFCM() on login).
   const snap = await db.ref(`/houses/${houseId}/members`).once('value');
   const members = snap.val() || [];
+  const allUsernames = members.map(function (m) { return m && m.username; }).filter(Boolean);
 
   const targets = [];
   members.forEach((m, idx) => {
     if (!m || !m.fcmToken) return;
-    if (String(m.username || '').toLowerCase() === String(addedByUsername || '').toLowerCase()) return; // don't notify whoever just added it
+    // trim + lowercase both sides — guards against stray whitespace or case differences
+    if (String(m.username || '').toLowerCase().trim() === String(addedByUsername || '').toLowerCase().trim()) return;
     targets.push({ idx, token: m.fcmToken, username: m.username });
   });
 
+  // Writes a full snapshot of what happened to houses/{houseId}/lastNotifyDebug —
+  // check that in the Firebase console any time, no need to catch a toast in the moment.
+  async function writeDebug(extra) {
+    try {
+      await db.ref(`/houses/${houseId}/lastNotifyDebug`).set(Object.assign({
+        version: DEBUG_VERSION,
+        time: new Date().toISOString(),
+        gotAddedByUsername: addedByUsername,
+        allMemberUsernames: allUsernames,
+        targetedUsernames: targets.map(t => t.username)
+      }, extra));
+    } catch (e) { /* never let a debug-write failure break the real notify */ }
+  }
+
   if (targets.length === 0) {
-    return res.status(200).json({ sent: 0, note: 'no flatmate tokens registered yet', gotAddedByUsername: addedByUsername });
+    await writeDebug({ sent: 0, note: 'no flatmate tokens registered yet' });
+    return res.status(200).json({ sent: 0, note: 'no flatmate tokens registered yet', gotAddedByUsername: addedByUsername, version: DEBUG_VERSION });
   }
 
   const title = 'New expense added';
@@ -62,17 +81,21 @@ module.exports = async (req, res) => {
     webpush: { fcmOptions: { link: 'https://ayushup495.github.io/FlatSplits/' } }
   });
 
-  // A dead/expired token means that member needs to log in again to get a fresh one —
-  // clear it so we stop trying to send to it.
   const deadCodes = ['messaging/invalid-registration-token', 'messaging/registration-token-not-registered'];
   const clears = [];
+  const errorDetails = [];
   response.responses.forEach((r, i) => {
-    if (!r.success && deadCodes.includes(r.error && r.error.code)) {
-      const badIdx = targets[i].idx;
-      clears.push(db.ref(`/houses/${houseId}/members/${badIdx}/fcmToken`).remove());
+    if (!r.success) {
+      errorDetails.push({ username: targets[i].username, code: (r.error && r.error.code) || 'unknown' });
+      if (deadCodes.includes(r.error && r.error.code)) {
+        const badIdx = targets[i].idx;
+        clears.push(db.ref(`/houses/${houseId}/members/${badIdx}/fcmToken`).remove());
+      }
     }
   });
   await Promise.all(clears);
 
-  return res.status(200).json({ sent: response.successCount, failed: response.failureCount, targeted: targets.map(t => t.username) });
+  await writeDebug({ sent: response.successCount, failed: response.failureCount, errors: errorDetails });
+
+  return res.status(200).json({ sent: response.successCount, failed: response.failureCount, targeted: targets.map(t => t.username), version: DEBUG_VERSION });
 };
