@@ -4,7 +4,7 @@
 
 const admin = require('firebase-admin');
 
-const DEBUG_VERSION = 'v3-debug';
+const DEBUG_VERSION = 'v4-debug';
 
 function getAdmin() {
   if (!admin.apps.length) {
@@ -25,11 +25,37 @@ module.exports = async (req, res) => {
     return res.status(405).json({ error: 'POST only', version: DEBUG_VERSION });
   }
 
-  if (req.headers['x-notify-secret'] !== process.env.NOTIFY_SECRET) {
+  const body = req.body || {};
+  const { houseId, addedByUsername, addedByName, description, amount } = body;
+
+  // Trim both sides — the same kind of stray-whitespace issue we already hit once on GitHub
+  // could just as easily be sitting in the secret value.
+  const receivedSecret = String(req.headers['x-notify-secret'] || '').trim();
+  const expectedSecret = String(process.env.NOTIFY_SECRET || '').trim();
+  const secretOk = receivedSecret === expectedSecret;
+
+  // Writes a breadcrumb for EVERY POST that reaches this function, pass or fail,
+  // so nothing can happen invisibly. Check houses/{houseId}/lastNotifyDebug after any test.
+  async function writeDebug(extra) {
+    if (!houseId) return;
+    try {
+      const fbAdmin = getAdmin();
+      await fbAdmin.database().ref(`/houses/${houseId}/lastNotifyDebug`).set(Object.assign({
+        version: DEBUG_VERSION,
+        time: new Date().toISOString(),
+        gotAddedByUsername: addedByUsername || null,
+        secretOk: secretOk,
+        receivedSecretLength: receivedSecret.length,
+        expectedSecretLength: expectedSecret.length
+      }, extra));
+    } catch (e) { /* never let a debug-write failure break the real notify */ }
+  }
+
+  if (!secretOk) {
+    await writeDebug({ stoppedAt: 'secret check' });
     return res.status(401).json({ error: 'unauthorized', version: DEBUG_VERSION });
   }
 
-  const { houseId, addedByUsername, addedByName, description, amount } = req.body || {};
   if (!houseId || !addedByUsername) {
     return res.status(400).json({ error: 'houseId and addedByUsername are required', version: DEBUG_VERSION });
   }
@@ -46,38 +72,23 @@ module.exports = async (req, res) => {
   const targets = [];
   members.forEach((m, idx) => {
     if (!m || !m.fcmToken) return;
-    // trim + lowercase both sides — guards against stray whitespace or case differences
     if (String(m.username || '').toLowerCase().trim() === String(addedByUsername || '').toLowerCase().trim()) return;
     targets.push({ idx, token: m.fcmToken, username: m.username });
   });
 
-  // Writes a full snapshot of what happened to houses/{houseId}/lastNotifyDebug —
-  // check that in the Firebase console any time, no need to catch a toast in the moment.
-  async function writeDebug(extra) {
-    try {
-      await db.ref(`/houses/${houseId}/lastNotifyDebug`).set(Object.assign({
-        version: DEBUG_VERSION,
-        time: new Date().toISOString(),
-        gotAddedByUsername: addedByUsername,
-        allMemberUsernames: allUsernames,
-        targetedUsernames: targets.map(t => t.username)
-      }, extra));
-    } catch (e) { /* never let a debug-write failure break the real notify */ }
-  }
-
   if (targets.length === 0) {
-    await writeDebug({ sent: 0, note: 'no flatmate tokens registered yet' });
+    await writeDebug({ stoppedAt: 'no targets', sent: 0, allMemberUsernames: allUsernames, targetedUsernames: [] });
     return res.status(200).json({ sent: 0, note: 'no flatmate tokens registered yet', gotAddedByUsername: addedByUsername, version: DEBUG_VERSION });
   }
 
   const title = 'New expense added';
-  const body = amount
+  const bodyText = amount
     ? `${addedByName || addedByUsername} added ₹${amount}${description ? ' for ' + description : ''}. Tap to see how much you owe.`
     : `${addedByName || addedByUsername} added a new expense. Tap to see how much you owe.`;
 
   const response = await fbAdmin.messaging().sendEachForMulticast({
     tokens: targets.map(t => t.token),
-    notification: { title, body },
+    notification: { title, body: bodyText },
     webpush: { fcmOptions: { link: 'https://ayushup495.github.io/FlatSplits/' } }
   });
 
@@ -95,7 +106,14 @@ module.exports = async (req, res) => {
   });
   await Promise.all(clears);
 
-  await writeDebug({ sent: response.successCount, failed: response.failureCount, errors: errorDetails });
+  await writeDebug({
+    stoppedAt: 'completed',
+    sent: response.successCount,
+    failed: response.failureCount,
+    allMemberUsernames: allUsernames,
+    targetedUsernames: targets.map(t => t.username),
+    errors: errorDetails
+  });
 
   return res.status(200).json({ sent: response.successCount, failed: response.failureCount, targeted: targets.map(t => t.username), version: DEBUG_VERSION });
 };
