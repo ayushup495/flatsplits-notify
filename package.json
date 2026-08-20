@@ -1,0 +1,11 @@
+{
+  "name": "flatsplits-notify",
+  "version": "1.0.0",
+  "private": true,
+  "engines": {
+    "node": "22.x"
+  },
+  "dependencies": {
+    "firebase-admin": "^14.2.0"
+  }
+}
